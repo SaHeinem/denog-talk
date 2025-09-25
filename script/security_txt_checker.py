@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import ssl
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from sectxt import Finding, SecurityTxtReport, analyze_security_txt
+
 PATH = "/.well-known/security.txt"
 USER_AGENT = "security-txt-checker/1.0"
-MAX_VALIDITY = timedelta(days=366)
 
 
 @dataclass
@@ -26,6 +27,10 @@ class CheckResult:
     expires_ok: bool
     is_valid: bool
     error: str | None = None
+    errors: list[Finding] | None = None
+    recommendations: list[Finding] | None = None
+    notifications: list[Finding] | None = None
+    report: SecurityTxtReport | None = None
 
 
 def normalize_domain(domain: str) -> str:
@@ -45,55 +50,9 @@ def normalize_domain(domain: str) -> str:
     return host
 
 
-def parse_expires(raw_value: str) -> datetime | None:
-    """Parse an Expires value into a timezone-aware UTC datetime."""
-
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-
-    try:
-        expires = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-
-    return expires.astimezone(timezone.utc)
-
-
-def evaluate_security_txt(body: str) -> tuple[bool, datetime | None, bool, bool]:
-    """Return presence of Contact, Expires, whether Expires is acceptable, and overall validity."""
-
-    contact_present = False
-    expires_value: datetime | None = None
-
-    for line in body.splitlines():
-        if ":" not in line:
-            continue
-        field, value = line.split(":", 1)
-        field = field.strip().lower()
-        value = value.strip()
-
-        # We only care about the first occurrence of these directive names.
-        if field == "contact" and value:
-            contact_present = True
-        elif field == "expires" and value and expires_value is None:
-            expires_value = parse_expires(value)
-
-    now = datetime.now(timezone.utc)
-    expires_ok = False
-    if expires_value is not None:
-        valid_duration = expires_value - now
-        expires_ok = timedelta(0) <= valid_duration <= MAX_VALIDITY
-
-    is_valid = contact_present and expires_ok
-
-    return contact_present, expires_value, expires_ok, is_valid
+def _empty_lists() -> tuple[list[Finding], list[Finding], list[Finding]]:
+    """Provide fresh containers for error, recommendation, and notification lists."""
+    return [], [], []
 
 
 def fetch(url: str) -> tuple[int | None, str | None, str | None]:
@@ -110,6 +69,9 @@ def fetch(url: str) -> tuple[int | None, str | None, str | None]:
         return error.code, None, None
     except URLError as error:
         return None, None, str(error.reason)
+    except OSError as error:
+        # Capture socket-level failures such as connection resets.
+        return None, None, str(error)
 
 
 def check_url(url: str) -> CheckResult:
@@ -122,8 +84,25 @@ def check_url(url: str) -> CheckResult:
     expires_ok = False
     is_valid = False
 
+    analysis: SecurityTxtReport | None = None
+    errors_list, recommendations_list, notifications_list = _empty_lists()
+
     if status == 200 and body is not None:
-        contact_present, expires_value, expires_ok, is_valid = evaluate_security_txt(body)
+        analysis = analyze_security_txt(body)
+        contact_present = bool(analysis.contacts)
+        expires_value = analysis.expires
+        expires_ok = analysis.expires_ok
+        is_valid = analysis.is_valid
+        errors_list = analysis.errors
+        recommendations_list = analysis.recommendations
+        notifications_list = analysis.notifications
+    else:
+        if status is None:
+            errors_list.append(
+                Finding("network", error or "Request failed before receiving a response")
+            )
+        elif status != 200:
+            errors_list.append(Finding("http_status", f"Received HTTP status {status}"))
 
     return CheckResult(
         url=url,
@@ -133,6 +112,10 @@ def check_url(url: str) -> CheckResult:
         expires_ok=expires_ok,
         is_valid=is_valid,
         error=error,
+        errors=errors_list,
+        recommendations=recommendations_list,
+        notifications=notifications_list,
+        report=analysis,
     )
 
 
@@ -157,24 +140,30 @@ def format_result(result: CheckResult) -> Iterable[str]:
     header = f"{result.url} -> {result.status if result.status is not None else 'error'}"
     yield header
 
-    if result.error:
+    if result.error and not (result.errors or result.recommendations or result.notifications):
         yield f"  Error: {result.error}"
-        return
 
-    if result.status != 200:
-        return
+    if result.status == 200:
+        contact_msg = "found" if result.contact_present else "missing"
+        yield f"  Contact: {contact_msg}"
 
-    contact_msg = "found" if result.contact_present else "missing"
-    yield f"  Contact: {contact_msg}"
+        if result.expires is None:
+            yield "  Expires: missing or unparsable"
+        else:
+            validity_msg = "ok" if result.expires_ok else "invalid range"
+            yield f"  Expires: {result.expires.isoformat()} ({validity_msg})"
 
-    if result.expires is None:
-        yield "  Expires: missing or unparsable"
-    else:
-        validity_msg = "ok" if result.expires_ok else "invalid range"
-        yield f"  Expires: {result.expires.isoformat()} ({validity_msg})"
+        if result.is_valid:
+            yield "  Valid"
 
-    if result.is_valid:
-        yield "  Valid"
+    for finding in result.errors or []:
+        yield f"  Error[{finding.code}]: {finding.message}"
+
+    for finding in result.recommendations or []:
+        yield f"  Recommendation[{finding.code}]: {finding.message}"
+
+    for finding in result.notifications or []:
+        yield f"  Note[{finding.code}]: {finding.message}"
 
 
 __all__ = [
