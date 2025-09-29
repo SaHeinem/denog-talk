@@ -48,6 +48,8 @@ class SecurityTxtReport:
     contacts: list[str]
     expires: datetime | None
     expires_ok: bool
+    canonicals: list[str]
+    pgp_signed: bool
     errors: list[Finding]
     recommendations: list[Finding]
     notifications: list[Finding]
@@ -66,18 +68,24 @@ class SecurityTxtParser:
 
     def parse(self) -> SecurityTxtReport:
         contacts: list[str] = []
+        canonicals: list[str] = []
         expires_value: datetime | None = None
         errors: list[Finding] = []
         recommendations: list[Finding] = []
         notifications: list[Finding] = []
+        pgp_signed = False
 
         in_signature = False
         for line_number, raw_line in enumerate(self.content.splitlines(), start=1):
             line = raw_line.strip()
 
             if line.startswith("-----BEGIN PGP SIGNED MESSAGE-----"):
+                pgp_signed = True
                 notifications.append(
-                    Finding("pgp_signed", "security.txt is PGP signed; signature ignored for parsing")
+                    Finding(
+                        "pgp_signed",
+                        "security.txt is PGP signed; signature ignored for parsing",
+                    )
                 )
                 continue
 
@@ -121,6 +129,8 @@ class SecurityTxtParser:
 
             if field == "contact":
                 contacts.append(value)
+            elif field == "canonical":
+                canonicals.append(value)
             elif field == "expires" and expires_value is None:
                 parsed = self._parse_timestamp(value)
                 if parsed is None:
@@ -163,6 +173,8 @@ class SecurityTxtParser:
             contacts=contacts,
             expires=expires_value,
             expires_ok=expires_ok,
+            canonicals=canonicals,
+            pgp_signed=pgp_signed,
             errors=errors,
             recommendations=recommendations,
             notifications=notifications,

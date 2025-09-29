@@ -26,6 +26,8 @@ class CheckResult:
     expires: datetime | None
     expires_ok: bool
     is_valid: bool
+    canonicals: list[str] | None = None
+    pgp_signed: bool = False
     error: str | None = None
     errors: list[Finding] | None = None
     recommendations: list[Finding] | None = None
@@ -53,6 +55,14 @@ def normalize_domain(domain: str) -> str:
 def _empty_lists() -> tuple[list[Finding], list[Finding], list[Finding]]:
     """Provide fresh containers for error, recommendation, and notification lists."""
     return [], [], []
+
+
+def _normalize_url_for_compare(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path.rstrip("/") or "/"
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+    return value.strip().rstrip("/").lower()
 
 
 def fetch(url: str) -> tuple[int | None, str | None, str | None]:
@@ -83,6 +93,8 @@ def check_url(url: str) -> CheckResult:
     expires_value: datetime | None = None
     expires_ok = False
     is_valid = False
+    canonicals: list[str] | None = None
+    pgp_signed = False
 
     analysis: SecurityTxtReport | None = None
     errors_list, recommendations_list, notifications_list = _empty_lists()
@@ -93,6 +105,8 @@ def check_url(url: str) -> CheckResult:
         expires_value = analysis.expires
         expires_ok = analysis.expires_ok
         is_valid = analysis.is_valid
+        canonicals = analysis.canonicals
+        pgp_signed = analysis.pgp_signed
         errors_list = analysis.errors
         recommendations_list = analysis.recommendations
         notifications_list = analysis.notifications
@@ -111,6 +125,8 @@ def check_url(url: str) -> CheckResult:
         expires=expires_value,
         expires_ok=expires_ok,
         is_valid=is_valid,
+        canonicals=canonicals,
+        pgp_signed=pgp_signed,
         error=error,
         errors=errors_list,
         recommendations=recommendations_list,
@@ -132,6 +148,53 @@ def check_domain(domain: str, include_www: bool = True) -> list[CheckResult]:
         urls.append(f"https://www.{host}{PATH}")
 
     return [check_url(url) for url in urls]
+
+
+def compute_flags(results: list[CheckResult]) -> dict[str, bool]:
+    """Summarize boolean flags derived from a collection of check results."""
+
+    apex_result = next((item for item in results if "://www." not in item.url), None)
+    www_result = next((item for item in results if "://www." in item.url), None)
+
+    expected_apex_url = apex_result.url if apex_result is not None else None
+    expected_www_url = www_result.url if www_result is not None else None
+
+    def canonical_present(expected_url: str | None) -> bool:
+        if not expected_url:
+            return False
+        target = _normalize_url_for_compare(expected_url)
+        for result in results:
+            if result.report is None:
+                continue
+            for candidate in result.report.canonicals:
+                if _normalize_url_for_compare(candidate) == target:
+                    return True
+        return False
+
+    def findings_any(predicate) -> bool:
+        for result in results:
+            for finding in result.errors or []:
+                if predicate(finding):
+                    return True
+        return False
+
+    has_security_txt = any(result.status == 200 for result in results)
+    valid_any = any(result.status == 200 and result.is_valid for result in results)
+    expired = findings_any(lambda finding: finding.code == "expired")
+    long_expiry = findings_any(lambda finding: finding.code == "long_validity")
+    pgp = any(result.pgp_signed for result in results)
+    pgp_errors = findings_any(lambda finding: finding.code.startswith("pgp"))
+
+    return {
+        "valid": valid_any,
+        "security_txt": has_security_txt,
+        "http_canonical": canonical_present(expected_apex_url),
+        "www_canonical": canonical_present(expected_www_url),
+        "expired": expired,
+        "long_expiery": long_expiry,
+        "pgp": pgp,
+        "pgp_erros": pgp_errors,
+    }
 
 
 def format_result(result: CheckResult) -> Iterable[str]:
@@ -168,6 +231,7 @@ def format_result(result: CheckResult) -> Iterable[str]:
 
 __all__ = [
     "CheckResult",
+    "compute_flags",
     "check_domain",
     "check_url",
     "format_result",

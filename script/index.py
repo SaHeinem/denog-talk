@@ -6,14 +6,20 @@ import csv
 import sys
 from pathlib import Path
 
-from security_txt_checker import CheckResult, check_domain, format_result
+from security_txt_checker import CheckResult, check_domain, compute_flags, format_result
 
 INPUT_FILE = Path(__file__).with_name("input.csv")
 OUTPUT_FILE = Path(__file__).with_name("output.csv")
 FIELDNAMES = [
     "domain",
-    "valid_apex",
-    "valid_www",
+    "security txt",
+    "valid",
+    "http canonical",
+    "www canonical",
+    "expired",
+    "long expiery",
+    "pgp",
+    "pgp erros",
     "errors",
     "recommendations",
     "notifications",
@@ -72,11 +78,10 @@ def print_results(domain: str, results: list[CheckResult]) -> None:
             print(line)
 
 
-def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, str]:
+def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, object]:
     """Produce a CSV-friendly summary for a domain."""
 
     apex_result = next((item for item in results if "://www." not in item.url), None)
-    www_result = next((item for item in results if "://www." in item.url), None)
 
     def collect(findings_attr: str) -> str:
         """Collect unique finding messages, ignoring www.* URLs."""
@@ -98,21 +103,18 @@ def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, str]:
     if apex_result is None and results:
         apex_result = results[0]
 
-    apex_valid = (
-        "yes"
-        if apex_result and apex_result.status == 200 and apex_result.is_valid
-        else "no"
-    )
-    www_valid = (
-        "yes"
-        if www_result and www_result.status == 200 and www_result.is_valid
-        else "no"
-    )
+    flags = compute_flags(results)
 
     return {
         "domain": domain,
-        "valid_apex": apex_valid,
-        "valid_www": www_valid,
+        "valid": bool(flags.get("valid", False)),
+        "security txt": bool(flags.get("security_txt", False)),
+        "http canonical": bool(flags.get("http_canonical", False)),
+        "www canonical": bool(flags.get("www_canonical", False)),
+        "expired": bool(flags.get("expired", False)),
+        "long expiery": bool(flags.get("long_expiery", False)),
+        "pgp": bool(flags.get("pgp", False)),
+        "pgp erros": bool(flags.get("pgp_erros", False)),
         "errors": collect("errors"),
         "recommendations": collect("recommendations"),
         "notifications": collect("notifications"),
@@ -120,19 +122,22 @@ def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, str]:
 
 
 def ensure_output_file() -> None:
-    """Create output.csv with header if needed."""
+    """Ensure output.csv exists with the expected header."""
 
-    needs_header = True
-    if OUTPUT_FILE.exists():
-        needs_header = OUTPUT_FILE.stat().st_size == 0
+    header_matches = False
+    if OUTPUT_FILE.exists() and OUTPUT_FILE.stat().st_size > 0:
+        with OUTPUT_FILE.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, [])
+            header_matches = existing_header == FIELDNAMES
 
-    if needs_header:
+    if not header_matches:
         with OUTPUT_FILE.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=FIELDNAMES)
             writer.writeheader()
 
 
-def append_row(row: dict[str, str]) -> None:
+def append_row(row: dict[str, object]) -> None:
     """Append a row to output.csv, assuming header already exists."""
 
     with OUTPUT_FILE.open("a", newline="", encoding="utf-8") as handle:
