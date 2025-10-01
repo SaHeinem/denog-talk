@@ -50,6 +50,7 @@ class SecurityTxtReport:
     expires_ok: bool
     canonicals: list[str]
     pgp_signed: bool
+    machine_readable: bool
     errors: list[Finding]
     recommendations: list[Finding]
     notifications: list[Finding]
@@ -74,9 +75,13 @@ class SecurityTxtParser:
         recommendations: list[Finding] = []
         notifications: list[Finding] = []
         pgp_signed = False
+        machine_readable = True
+
+        lines = self.content.splitlines()
 
         in_signature = False
-        for line_number, raw_line in enumerate(self.content.splitlines(), start=1):
+        saw_directive = False
+        for line_number, raw_line in enumerate(lines, start=1):
             line = raw_line.strip()
 
             if line.startswith("-----BEGIN PGP SIGNED MESSAGE-----"):
@@ -117,6 +122,7 @@ class SecurityTxtParser:
             field, value = line.split(":", 1)
             field = field.strip().lower()
             value = value.strip()
+            saw_directive = True
 
             if not value:
                 errors.append(Finding("empty_value", f"Line {line_number} for '{field}' has no value"))
@@ -169,12 +175,19 @@ class SecurityTxtParser:
         if not contacts:
             errors.append(Finding("missing_contact", "At least one Contact directive is required"))
 
+        if not saw_directive:
+            errors.append(
+                Finding("not_machine_readable", "Response is not machine-readable security.txt content")
+            )
+            machine_readable = False
+
         return SecurityTxtReport(
             contacts=contacts,
             expires=expires_value,
             expires_ok=expires_ok,
             canonicals=canonicals,
             pgp_signed=pgp_signed,
+            machine_readable=machine_readable,
             errors=errors,
             recommendations=recommendations,
             notifications=notifications,

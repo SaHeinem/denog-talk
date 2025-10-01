@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import socket
+import ssl
 from dataclasses import dataclass
 from datetime import datetime
-import ssl
 from typing import Iterable
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -14,6 +16,9 @@ from sectxt import Finding, SecurityTxtReport, analyze_security_txt
 
 PATH = "/.well-known/security.txt"
 USER_AGENT = "security-txt-checker/1.0"
+REQUEST_TIMEOUT = 10  # seconds
+_LABEL_PATTERN = r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+_HOSTNAME_RE = re.compile(rf"^{_LABEL_PATTERN}(?:\.{_LABEL_PATTERN})*$")
 
 
 @dataclass
@@ -28,11 +33,13 @@ class CheckResult:
     is_valid: bool
     canonicals: list[str] | None = None
     pgp_signed: bool = False
+    machine_readable: bool = True
     error: str | None = None
     errors: list[Finding] | None = None
     recommendations: list[Finding] | None = None
     notifications: list[Finding] | None = None
     report: SecurityTxtReport | None = None
+    final_url: str | None = None
 
 
 def normalize_domain(domain: str) -> str:
@@ -52,6 +59,17 @@ def normalize_domain(domain: str) -> str:
     return host
 
 
+def is_hostname(candidate: str) -> bool:
+    """Return True when the value looks like a valid DNS hostname."""
+
+    value = candidate.strip().rstrip(".")
+    if not value or len(value) > 253:
+        return False
+    if any(char.isspace() for char in value):
+        return False
+    return bool(_HOSTNAME_RE.fullmatch(value))
+
+
 def _empty_lists() -> tuple[list[Finding], list[Finding], list[Finding]]:
     """Provide fresh containers for error, recommendation, and notification lists."""
     return [], [], []
@@ -65,29 +83,37 @@ def _normalize_url_for_compare(value: str) -> str:
     return value.strip().rstrip("/").lower()
 
 
-def fetch(url: str) -> tuple[int | None, str | None, str | None]:
-    """Fetch a URL and return status code, body, and error message."""
+def fetch(url: str) -> tuple[int | None, str | None, str | None, str | None]:
+    """Fetch a URL and return status code, body, error message, and final URL."""
 
     request = Request(url, headers={"User-Agent": USER_AGENT})
 
     try:
-        with urlopen(request, context=ssl.create_default_context()) as response:
+        with urlopen(
+            request,
+            context=ssl.create_default_context(),
+            timeout=REQUEST_TIMEOUT,
+        ) as response:
             body = response.read().decode("utf-8", errors="replace")
-            return response.getcode(), body, None
+            return response.getcode(), body, None, response.geturl()
     except HTTPError as error:
         # We got a response with an HTTP status (e.g., 404), so the error field stays empty.
-        return error.code, None, None
+        return error.code, None, None, error.geturl() if hasattr(error, "geturl") else url
+    except (TimeoutError, socket.timeout):
+        return None, None, f"Request timed out after {REQUEST_TIMEOUT} seconds", None
     except URLError as error:
-        return None, None, str(error.reason)
+        return None, None, str(error.reason), None
+    except ValueError as error:
+        return None, None, str(error), None
     except OSError as error:
         # Capture socket-level failures such as connection resets.
-        return None, None, str(error)
+        return None, None, str(error), None
 
 
 def check_url(url: str) -> CheckResult:
     """Check a single security.txt URL."""
 
-    status, body, error = fetch(url)
+    status, body, error, final_url = fetch(url)
 
     contact_present = False
     expires_value: datetime | None = None
@@ -95,6 +121,7 @@ def check_url(url: str) -> CheckResult:
     is_valid = False
     canonicals: list[str] | None = None
     pgp_signed = False
+    machine_readable = False
 
     analysis: SecurityTxtReport | None = None
     errors_list, recommendations_list, notifications_list = _empty_lists()
@@ -107,6 +134,7 @@ def check_url(url: str) -> CheckResult:
         is_valid = analysis.is_valid
         canonicals = analysis.canonicals
         pgp_signed = analysis.pgp_signed
+        machine_readable = analysis.machine_readable
         errors_list = analysis.errors
         recommendations_list = analysis.recommendations
         notifications_list = analysis.notifications
@@ -120,6 +148,7 @@ def check_url(url: str) -> CheckResult:
 
     return CheckResult(
         url=url,
+        final_url=final_url,
         status=status,
         contact_present=contact_present,
         expires=expires_value,
@@ -127,6 +156,7 @@ def check_url(url: str) -> CheckResult:
         is_valid=is_valid,
         canonicals=canonicals,
         pgp_signed=pgp_signed,
+        machine_readable=machine_readable,
         error=error,
         errors=errors_list,
         recommendations=recommendations_list,
@@ -156,8 +186,15 @@ def compute_flags(results: list[CheckResult]) -> dict[str, bool]:
     apex_result = next((item for item in results if "://www." not in item.url), None)
     www_result = next((item for item in results if "://www." in item.url), None)
 
-    expected_apex_url = apex_result.url if apex_result is not None else None
-    expected_www_url = www_result.url if www_result is not None else None
+    def expected_url(result: CheckResult | None) -> str | None:
+        if result is None:
+            return None
+        if result.final_url:
+            return result.final_url
+        return result.url
+
+    expected_apex_url = expected_url(apex_result)
+    expected_www_url = expected_url(www_result)
 
     def canonical_present(expected_url: str | None) -> bool:
         if not expected_url:
@@ -180,6 +217,9 @@ def compute_flags(results: list[CheckResult]) -> dict[str, bool]:
 
     has_security_txt = any(result.status == 200 for result in results)
     valid_any = any(result.status == 200 and result.is_valid for result in results)
+    machine_readable = has_security_txt and all(
+        result.machine_readable for result in results if result.status == 200
+    )
     expired = findings_any(lambda finding: finding.code == "expired")
     long_expiry = findings_any(lambda finding: finding.code == "long_validity")
     pgp = any(result.pgp_signed for result in results)
@@ -188,12 +228,13 @@ def compute_flags(results: list[CheckResult]) -> dict[str, bool]:
     return {
         "valid": valid_any,
         "security_txt": has_security_txt,
-        "http_canonical": canonical_present(expected_apex_url),
-        "www_canonical": canonical_present(expected_www_url),
+        "http_canonical_match": canonical_present(expected_apex_url),
+        "www_canonical_match": canonical_present(expected_www_url),
         "expired": expired,
         "long_expiery": long_expiry,
         "pgp": pgp,
         "pgp_erros": pgp_errors,
+        "machine_readable": machine_readable,
     }
 
 
@@ -210,6 +251,9 @@ def format_result(result: CheckResult) -> Iterable[str]:
         contact_msg = "found" if result.contact_present else "missing"
         yield f"  Contact: {contact_msg}"
 
+        if result.final_url and _normalize_url_for_compare(result.final_url) != _normalize_url_for_compare(result.url):
+            yield f"  Final URL: {result.final_url}"
+
         if result.expires is None:
             yield "  Expires: missing or unparsable"
         else:
@@ -218,6 +262,8 @@ def format_result(result: CheckResult) -> Iterable[str]:
 
         if result.is_valid:
             yield "  Valid"
+        elif not result.machine_readable:
+            yield "  Not machine readable"
 
     for finding in result.errors or []:
         yield f"  Error[{finding.code}]: {finding.message}"
@@ -236,4 +282,5 @@ __all__ = [
     "check_url",
     "format_result",
     "normalize_domain",
+    "is_hostname",
 ]

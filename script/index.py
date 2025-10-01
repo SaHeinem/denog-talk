@@ -6,7 +6,14 @@ import csv
 import sys
 from pathlib import Path
 
-from security_txt_checker import CheckResult, check_domain, compute_flags, format_result
+from security_txt_checker import (
+    CheckResult,
+    check_domain,
+    compute_flags,
+    format_result,
+    is_hostname,
+    normalize_domain,
+)
 
 INPUT_FILE = Path(__file__).with_name("input.csv")
 OUTPUT_FILE = Path(__file__).with_name("output.csv")
@@ -14,8 +21,12 @@ FIELDNAMES = [
     "domain",
     "security txt",
     "valid",
+    "http status",
+    "www status",
     "http canonical",
+    "http canonical match",
     "www canonical",
+    "www canonical match",
     "expired",
     "long expiery",
     "pgp",
@@ -33,6 +44,19 @@ def iter_domains(path: Path) -> list[str]:
         return []
 
     domains: list[str] = []
+    seen: set[str] = set()
+
+    def add_domain(candidate: str) -> None:
+        normalized = normalize_domain(candidate)
+        if not normalized:
+            return
+        if not is_hostname(normalized):
+            print(f"Skipping '{candidate}': not a valid hostname")
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        domains.append(normalized)
 
     with path.open(newline="", encoding="utf-8") as handle:
         # Try header-aware parsing first so users get a labeled column.
@@ -47,7 +71,7 @@ def iter_domains(path: Path) -> list[str]:
             for row in reader:
                 value = (row.get(domain_key) or "").strip()
                 if value:
-                    domains.append(value)
+                    add_domain(value)
         else:
             # Fallback: treat the file as a plain single-column CSV without headers.
             handle.seek(0)
@@ -59,7 +83,7 @@ def iter_domains(path: Path) -> list[str]:
                 candidate = row[0].strip()
                 if not candidate or candidate.lower() in header_markers:
                     continue
-                domains.append(candidate)
+                add_domain(candidate)
 
     return domains
 
@@ -83,10 +107,12 @@ def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, objec
 
     apex_result = next((item for item in results if "://www." not in item.url), None)
 
+    primary_result = apex_result if apex_result is not None else (results[0] if results else None)
+
     def collect(findings_attr: str) -> str:
         """Collect unique finding messages, ignoring www.* URLs."""
 
-        sources = [apex_result] if apex_result is not None else []
+        sources = [primary_result] if primary_result is not None else []
         if not sources:
             sources = results
 
@@ -100,17 +126,44 @@ def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, objec
                     messages.append(entry)
         return "; ".join(messages)
 
-    if apex_result is None and results:
-        apex_result = results[0]
-
     flags = compute_flags(results)
+    has_security_txt = bool(flags.get("security_txt", False))
+    machine_readable = bool(flags.get("machine_readable", False))
+    valid_flag = bool(flags.get("valid", False))
+
+    if has_security_txt and not machine_readable:
+        valid_value: object = "not machine readable"
+    else:
+        valid_value = valid_flag
+
+    www_result = next((item for item in results if "://www." in item.url), None)
+
+    def status_value(result: CheckResult | None) -> object:
+        if result is None:
+            return ""
+        if result.status is not None:
+            return result.status
+        return ""
+
+    def canonical_value(result: CheckResult | None) -> str:
+        if result is None or result.report is None or not result.report.canonicals:
+            return "missing"
+        canonicals = []
+        for candidate in result.report.canonicals:
+            if candidate not in canonicals:
+                canonicals.append(candidate)
+        return "; ".join(canonicals) if canonicals else "missing"
 
     return {
         "domain": domain,
-        "valid": bool(flags.get("valid", False)),
         "security txt": bool(flags.get("security_txt", False)),
-        "http canonical": bool(flags.get("http_canonical", False)),
-        "www canonical": bool(flags.get("www_canonical", False)),
+        "valid": valid_value,
+        "http status": status_value(apex_result),
+        "www status": status_value(www_result),
+        "http canonical": canonical_value(apex_result),
+        "http canonical match": bool(flags.get("http_canonical_match", False)),
+        "www canonical": canonical_value(www_result),
+        "www canonical match": bool(flags.get("www_canonical_match", False)),
         "expired": bool(flags.get("expired", False)),
         "long expiery": bool(flags.get("long_expiery", False)),
         "pgp": bool(flags.get("pgp", False)),
@@ -119,6 +172,17 @@ def summarize_domain(domain: str, results: list[CheckResult]) -> dict[str, objec
         "recommendations": collect("recommendations"),
         "notifications": collect("notifications"),
     }
+
+
+def reset_output_file() -> None:
+    """Delete any existing output.csv so each run starts fresh."""
+
+    try:
+        OUTPUT_FILE.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        print(f"Warning: Could not remove {OUTPUT_FILE}: {error}")
 
 
 def ensure_output_file() -> None:
@@ -146,6 +210,7 @@ def append_row(row: dict[str, object]) -> None:
 
 
 def main() -> int:
+    reset_output_file()
     domains = iter_domains(INPUT_FILE)
     if not domains:
         print(f"No domains found in {INPUT_FILE}")
