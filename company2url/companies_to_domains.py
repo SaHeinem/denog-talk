@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, re, sys, time
+import argparse, re, socket, sys, time
 from urllib.parse import urlencode
 import requests
 import pandas as pd
@@ -92,14 +92,15 @@ def wd_search_ids(query: str, limit: int = 5, country: str | None = None) -> lis
     return []
 
 
-def wd_entity_official_domains(qid: str) -> list[str]:
+def wd_entity_info(qid: str, languages: list[str]) -> tuple[list[str], list[str]]:
     r = requests.get(f"{WD_ENTITY}{qid}.json", timeout=20)
     if r.status_code != 200:
-        return []
+        return [], []
     ent = r.json().get("entities", {}).get(qid, {})
-    claims = ent.get("claims", {}).get("P856", [])  # P856 = official website
+    claims = ent.get("claims", {})
+    website_claims = claims.get("P856", [])  # P856 = official website
     urls = []
-    for c in claims:
+    for c in website_claims:
         url = ((c.get("mainsnak", {}) or {}).get("datavalue", {}) or {}).get("value")
         if url:
             d = to_domain(url)
@@ -112,15 +113,78 @@ def wd_entity_official_domains(qid: str) -> list[str]:
         if d not in seen:
             seen.add(d)
             out.append(d)
+    industries = wd_entity_industries(claims.get("P452", []), languages)
+    return out, industries
+
+
+def wd_entity_industries(claims: list[dict], languages: list[str]) -> list[str]:
+    if not claims:
+        return []
+    qids = []
+    for c in claims:
+        datavalue = ((c.get("mainsnak", {}) or {}).get("datavalue", {}) or {})
+        value = datavalue.get("value", {})
+        if isinstance(value, dict) and value.get("id"):
+            qids.append(value["id"])
+    if not qids:
+        return []
+    labels = wd_fetch_labels(qids, languages)
+    seen = set()
+    out = []
+    for qid in qids:
+        label = labels.get(qid)
+        if label and label not in seen:
+            seen.add(label)
+            out.append(label)
     return out
+
+
+def wd_fetch_labels(qids: list[str], languages: list[str]) -> dict[str, str]:
+    params = dict(
+        action="wbgetentities",
+        ids="|".join(qids),
+        props="labels",
+        languages="|".join(languages),
+        format="json",
+        origin="*",
+    )
+    try:
+        r = requests.get(WD_SEARCH, params=params, timeout=20)
+    except Exception:
+        return {}
+    if r.status_code != 200:
+        return {}
+    entities = r.json().get("entities", {})
+    result: dict[str, str] = {}
+    for qid, ent in entities.items():
+        labels = ent.get("labels", {})
+        for lang in languages:
+            if lang in labels and "value" in labels[lang]:
+                result[qid] = labels[lang]["value"]
+                break
+        else:
+            if labels:
+                any_label = next(iter(labels.values()))
+                if isinstance(any_label, dict) and "value" in any_label:
+                    result[qid] = any_label["value"]
+    return result
 
 
 def pick_preferred(domains: list[str], country: str | None) -> str | None:
     if not domains:
         return None
-    if country and country.upper() == "DE":
+    preferred_suffixes = [".com"]
+    if country:
+        preferred_suffixes.append(f".{country.lower()}")
+    seen_suffixes = set()
+    ordered_suffixes = []
+    for suffix in preferred_suffixes:
+        if suffix not in seen_suffixes:
+            ordered_suffixes.append(suffix)
+            seen_suffixes.add(suffix)
+    for suffix in ordered_suffixes:
         for d in domains:
-            if d.lower().endswith(".de"):
+            if d.lower().endswith(suffix):
                 return d
     return domains[0]
 
@@ -134,21 +198,69 @@ def heuristic(name: str, country: str | None) -> str | None:
     return base + tlds[0]
 
 
-def lookup_domain(
+def lookup_company(
     company: str, country: str | None = None, sleep_s: float = 0.2
-) -> str | None:
+) -> tuple[str | None, list[str]]:
     q = clean_name(company)
+    languages = _language_preferences(country)
     # 1) Wikidata search → official website(s)
     ids = wd_search_ids(q, country=country)
+    cached_industries: list[str] = []
     for qid in ids:
-        domains = wd_entity_official_domains(qid)
+        domains, industries = wd_entity_info(qid, languages)
+        if industries and not cached_industries:
+            cached_industries = industries
         if domains:
             pref = pick_preferred(domains, country)
             if pref:
-                return pref
+                return pref, industries or cached_industries
         time.sleep(sleep_s)  # be nice to the API
     # 2) conservative heuristic
-    return heuristic(q, country)
+    return heuristic(q, country), cached_industries
+
+
+def derive_base_slug(name: str, domain: str | None) -> str | None:
+    if domain:
+        host = domain.split(".")[0]
+        host = re.sub(r"[^a-z0-9-]", "", host.lower())
+        if host:
+            return host
+    cleaned = re.sub(r"[^a-z0-9-]", "", clean_name(name).lower())
+    return cleaned or None
+
+
+def normalize_tld(tld: str) -> str:
+    return tld.lower().lstrip(".")
+
+
+def tld_column_name(tld: str) -> str:
+    return f"domain_{tld.replace('.', '_')}"
+
+
+def probe_tld(
+    base_slug: str | None, tld: str, timeout: float
+) -> tuple[bool | None, str | None]:
+    if not base_slug:
+        return None, None
+    candidate = f"{base_slug}.{normalize_tld(tld)}"
+    exists = domain_resolves(candidate, timeout)
+    if exists:
+        return True, candidate
+    return exists, None
+
+
+def domain_resolves(domain: str, timeout: float) -> bool:
+    default_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.getaddrinfo(domain, None)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return False
+    finally:
+        socket.setdefaulttimeout(default_timeout)
 
 
 def read_any(path: str) -> pd.DataFrame:
@@ -194,6 +306,18 @@ def main():
     ap.add_argument(
         "--sleep", type=float, default=0.2, help="Delay between requests (seconds)."
     )
+    ap.add_argument(
+        "--check-tlds",
+        nargs="+",
+        metavar="TLD",
+        help="Optional list of TLDs to probe (e.g. --check-tlds de com io).",
+    )
+    ap.add_argument(
+        "--tld-timeout",
+        type=float,
+        default=1.0,
+        help="Socket timeout (seconds) for TLD probing (default: 1.0).",
+    )
     args = ap.parse_args()
 
     df = read_any(args.input)
@@ -209,19 +333,34 @@ def main():
             sys.exit(1)
 
     companies = df[args.name_col].astype(str).fillna("").tolist()
+    df["domain"] = ""
+    df["industry"] = ""
+    tld_list = [normalize_tld(t) for t in (args.check_tlds or [])]
+    for tld in tld_list:
+        df[tld_column_name(tld)] = None
 
-    results = []
-    for name in tqdm(companies, desc="Resolving domains"):
+    for idx, name in enumerate(tqdm(companies, desc="Resolving domains")):
         if not name.strip():
-            results.append("")
+            for tld in tld_list:
+                df.at[idx, tld_column_name(tld)] = None
             continue
         try:
-            d = lookup_domain(name, args.country, sleep_s=args.sleep)
+            d, inds = lookup_company(name, args.country, sleep_s=args.sleep)
         except Exception:
-            d = None
-        results.append(d or "")
-
-    df["domain"] = results
+            d, inds = None, []
+        domain_value = d
+        df.at[idx, "industry"] = "; ".join(inds)
+        candidate_domains: list[str] = []
+        if tld_list:
+            base_slug = derive_base_slug(name, d)
+            for tld in tld_list:
+                exists, candidate = probe_tld(base_slug, tld, args.tld_timeout)
+                df.at[idx, tld_column_name(tld)] = exists
+                if exists and candidate:
+                    candidate_domains.append(candidate)
+        if not domain_value and candidate_domains:
+            domain_value = pick_preferred(candidate_domains, args.country)
+        df.at[idx, "domain"] = domain_value or ""
 
     out_path = args.out
     if not out_path:
